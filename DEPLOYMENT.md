@@ -173,6 +173,13 @@ git push origin main
 
 ---
 
+## Credit & License
+
+- **Author**: Fuaad Abdullah
+- **License**: MIT License (see [LICENSE](LICENSE))
+
+---
+
 **Questions?** Feel free to debug locally with `streamlit run app.py` or check Streamlit Cloud logs in the dashboard.
 
 Happy deploying! 🚀🧟

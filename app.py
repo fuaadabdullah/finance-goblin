@@ -385,4 +385,7 @@ st.download_button(
 
 # Footer
 st.markdown("---")
-st.caption("🧟 **Finance Goblin** – Built with Streamlit, Pandas & Plotly. Your data stays in your browser. No fees. No BS.")
+st.caption(
+    "🧟 **Finance Goblin** – Built by Fuaad Abdullah with Streamlit, Pandas & Plotly. "
+    "Your data stays in your browser. Licensed under MIT."
+)

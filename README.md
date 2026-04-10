@@ -106,10 +106,14 @@ Date,Description,Credit,Debit
 
 Feel free to fork, improve, and submit pull requests. Contributions welcome!
 
+## 👤 Credit
+
+Created and maintained by **Fuaad Abdullah**.
+
 ## 📄 License
 
 MIT License. See LICENSE file for details.
 
 ---
 
-**Built with ❤️ for data-driven financial insights.** Questions? Reach out or open an issue on GitHub.
+**Built with ❤️ by Fuaad Abdullah for data-driven financial insights.** Questions? Reach out or open an issue on GitHub.

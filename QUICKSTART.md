@@ -93,4 +93,11 @@ git push origin main
 
 ---
 
+## Credit & License
+
+- **Author:** Fuaad Abdullah
+- **License:** MIT License (see [LICENSE](LICENSE))
+
+---
+
 **Status: Ready for GitHub push!** 🚀
