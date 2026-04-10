@@ -2,8 +2,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
+import plotly.graph_objects
 from datetime import datetime, timedelta
+import re
 import random
 from pathlib import Path
 
@@ -18,6 +19,18 @@ st.markdown("📊 **Data-Driven Insights** – Upload your bank CSV and uncover 
 # SAMPLE DATA GENERATOR (in-memory)
 # ------------------------------
 SAMPLE_DATA_PATH = Path("sample_data.csv")
+
+
+def normalize_description_text(description):
+    """Normalize merchant text for categorization and merchant grouping."""
+    normalized = str(description).lower()
+    normalized = normalized.replace("&", " and ")
+    normalized = normalized.replace("'", "")
+    normalized = normalized.replace("-", " ")
+    normalized = re.sub(r"\b\d+\b", " ", normalized)
+    normalized = re.sub(r"[^a-z\s]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
 
 
 def generate_sample_df(num_rows=45):
@@ -78,13 +91,16 @@ def generate_sample_df(num_rows=45):
         else:
             description = vendor
 
-        data.append([trans_date.strftime("%m/%d/%Y"), description, amount])
+        data.append([trans_date, description, amount])
 
     df = pd.DataFrame(data, columns=["Date", "Description", "Amount"])
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df = df.sort_values("Date", ascending=False).reset_index(drop=True)
+    df["Date"] = df["Date"].dt.strftime("%m/%d/%Y")
     return df
 
 
+@st.cache_data(show_spinner=False)
 def load_sample_df():
     """Load committed sample_data.csv; fallback to generated sample if missing."""
     if SAMPLE_DATA_PATH.exists():
@@ -109,6 +125,47 @@ def find_default_column(columns, candidates, fallback_index=0):
         return 0
     return min(fallback_index, len(columns) - 1)
 
+
+def parse_amount_series(series):
+    """Parse amount-like strings (currency, commas, parentheses) to numeric."""
+    cleaned = (
+        series.astype(str)
+        .str.strip()
+        .str.replace(r"\$", "", regex=True)
+        .str.replace(",", "", regex=False)
+        .str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+    )
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
+def detect_amount_sign_profile(series):
+    """Return quick sign profile stats for user guidance."""
+    amounts = parse_amount_series(series).dropna()
+    if amounts.empty:
+        return {"negative_ratio": 0.0, "positive_ratio": 0.0, "count": 0}
+
+    negative_ratio = float((amounts < 0).mean())
+    positive_ratio = float((amounts > 0).mean())
+    return {
+        "negative_ratio": negative_ratio,
+        "positive_ratio": positive_ratio,
+        "count": int(len(amounts)),
+    }
+
+
+def detect_credit_debit_profile(df, credit_col, debit_col):
+    """Return sign profile stats for separate credit/debit columns."""
+    credits = parse_amount_series(df[credit_col]).dropna()
+    debits = parse_amount_series(df[debit_col]).dropna()
+    credit_negative_ratio = float((credits < 0).mean()) if not credits.empty else 0.0
+    debit_negative_ratio = float((debits < 0).mean()) if not debits.empty else 0.0
+    return {
+        "credit_negative_ratio": credit_negative_ratio,
+        "debit_negative_ratio": debit_negative_ratio,
+        "credit_count": int(len(credits)),
+        "debit_count": int(len(debits)),
+    }
+
 # ------------------------------
 # CATEGORIZATION RULES
 # ------------------------------
@@ -128,7 +185,20 @@ CATEGORY_RULES = {
 
 
 def categorize(description):
-    desc_lower = str(description).lower()
+    desc_lower = normalize_description_text(description)
+    alias_map = {
+        "mcd": "mcdonald",
+        "mcds": "mcdonald",
+        "mcdonalds": "mcdonald",
+        "mcdonald s": "mcdonald",
+        "wholefoods": "whole foods",
+        "traderjoes": "trader joe",
+        "amazon marketplace": "amazon",
+        "apple com": "apple",
+    }
+    for alias, canonical in alias_map.items():
+        if alias in desc_lower:
+            desc_lower = desc_lower.replace(alias, canonical)
     for cat, keywords in CATEGORY_RULES.items():
         if cat == "📌 Other":
             continue
@@ -149,16 +219,22 @@ def clean_and_categorize(
     debit_col=None,
     invert_sign=False,
 ):
-    """Convert to standard columns, clean, and add Category."""
+    """Convert to standard columns and normalize to canonical direction.
+
+    Canonical format:
+    - Expenses / outflows are negative
+    - Income / inflows are positive
+    """
     df_clean = pd.DataFrame()
     df_clean["Date"] = pd.to_datetime(df[date_col], errors="coerce")
     df_clean["Description"] = df[desc_col].astype(str)
+    df_clean["Merchant"] = df_clean["Description"].apply(normalize_description_text)
 
     if amount_col is not None:
-        df_clean["Amount"] = pd.to_numeric(df[amount_col], errors="coerce")
+        df_clean["Amount"] = parse_amount_series(df[amount_col])
     else:
-        credits = pd.to_numeric(df[credit_col], errors="coerce").fillna(0).abs()
-        debits = pd.to_numeric(df[debit_col], errors="coerce").fillna(0).abs()
+        credits = parse_amount_series(df[credit_col]).fillna(0).abs()
+        debits = parse_amount_series(df[debit_col]).fillna(0).abs()
         df_clean["Amount"] = credits - debits
 
     if invert_sign:
@@ -190,6 +266,8 @@ st.sidebar.download_button(
     mime="text/csv",
     help="Realistic demo dataset (~3 months of transactions).",
 )
+
+analysis_view = "Expenses only"
 
 if uploaded_file is not None:
     try:
@@ -240,7 +318,40 @@ if uploaded_file is not None:
             index=find_default_column(columns, ["debit", "debits", "withdrawal"], fallback_index=3),
         )
 
-    invert_sign = st.sidebar.checkbox("Invert sign (if expenses are negative)", value=False)
+    analysis_view = st.sidebar.radio(
+        "Analysis view",
+        options=["Expenses only", "All transactions", "Income vs expenses"],
+        index=0,
+    )
+
+    invert_sign = False
+
+    if parse_mode == "3-column (Amount)" and amount_col is not None:
+        sign_profile = detect_amount_sign_profile(raw_df[amount_col])
+        if sign_profile["count"] > 0:
+            if sign_profile["positive_ratio"] >= 0.95:
+                invert_sign = True
+                st.sidebar.info(
+                    "Detected positive amounts. Treating them as expenses and flipping signs automatically."
+                )
+            elif sign_profile["negative_ratio"] >= 0.95:
+                st.sidebar.info("Detected negative amounts. Using them as-is.")
+            else:
+                invert_sign = st.sidebar.checkbox(
+                    "Treat positive amounts as expenses",
+                    value=False,
+                    help="Use this when your CSV stores outflows as positive numbers.",
+                )
+                if invert_sign:
+                    st.sidebar.warning("Positive amounts will be treated as spending.")
+    elif parse_mode == "4-column (Credit/Debit)" and credit_col is not None and debit_col is not None:
+        st.sidebar.info("Credit/Debit layout detected. Debits are treated as negative automatically.")
+        cd_profile = detect_credit_debit_profile(raw_df, credit_col, debit_col)
+        if cd_profile["credit_negative_ratio"] > 0 or cd_profile["debit_negative_ratio"] > 0:
+            st.sidebar.warning(
+                "Credit/Debit columns contain signed values. "
+                "They will be normalized to canonical direction during import."
+            )
 
     df = clean_and_categorize(
         raw_df,
@@ -257,6 +368,15 @@ else:
     df = clean_and_categorize(sample_df, "Date", "Description", amount_col="Amount", invert_sign=False)
     st.session_state["df"] = df
     st.sidebar.info("Using sample_data.csv by default. Upload your own CSV to replace.")
+
+st.subheader("🧼 Cleaned Data Preview")
+st.caption("Parsed columns after normalization so you can verify the import before exploring the dashboard.")
+st.dataframe(
+    df[["Date", "Description", "Merchant", "Category", "Amount"]].head(10),
+    use_container_width=True,
+    hide_index=True,
+    column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")},
+)
 
 # ------------------------------
 # MAIN DASHBOARD
@@ -292,67 +412,171 @@ if df_filtered.empty:
 # ------------------------------
 # METRICS
 # ------------------------------
-total_spent = df_filtered["Amount"].sum()  # negative sum
-total_spent_abs = abs(total_spent)
-avg_transaction = df_filtered["Amount"].mean()
+expense_df = df_filtered[df_filtered["Amount"] < 0].copy()
+income_df = df_filtered[df_filtered["Amount"] > 0].copy()
+
+total_income = income_df["Amount"].sum()
+total_expenses = expense_df["Amount"].abs().sum()
+net_cash_flow = total_income - total_expenses
+avg_expense = expense_df["Amount"].abs().mean() if not expense_df.empty else 0.0
 num_transactions = len(df_filtered)
 
 col1, col2, col3 = st.columns(3)
-col1.metric("💸 Total Spent", f"${total_spent_abs:,.2f}")
-col2.metric("📊 Avg Transaction", f"${abs(avg_transaction):,.2f}")
-col3.metric("🔢 Transactions", num_transactions)
+if analysis_view == "Expenses only":
+    col1.metric("💸 Total Spent", f"${total_expenses:,.2f}")
+    col2.metric("📊 Avg Expense", f"${avg_expense:,.2f}")
+    col3.metric("🔢 Transactions", num_transactions)
+else:
+    col1.metric("💰 Total Income", f"${total_income:,.2f}")
+    col2.metric("💸 Total Expenses", f"${total_expenses:,.2f}")
+    col3.metric("🧾 Net Cash Flow", f"${net_cash_flow:,.2f}")
 
 # ------------------------------
 # CHARTS
 # ------------------------------
 st.subheader("📈 Spending Analysis")
 
-# 1. Monthly bar chart
-df_filtered["Month"] = df_filtered["Date"].dt.to_period("M").astype(str)
-monthly = df_filtered.groupby("Month")["Amount"].sum().reset_index()
-monthly["Amount"] = monthly["Amount"].abs()  # positive for bar
-fig_monthly = px.bar(
-    monthly,
-    x="Month",
-    y="Amount",
-    title="Monthly Spending",
-    labels={"Amount": "Total Spent ($)", "Month": ""},
-    color_discrete_sequence=["#1e3a5f"],  # Navy blue for trust & stability
-)
-fig_monthly.update_layout(template="plotly_white", font=dict(family="sans-serif", size=12))
-st.plotly_chart(fig_monthly, use_container_width=True)
+if analysis_view == "Expenses only":
+    chart_df = expense_df.copy()
+    if chart_df.empty:
+        st.info("No expense transactions in the selected filters. Charts show spending only.")
+    else:
+        chart_df["MonthPeriod"] = chart_df["Date"].dt.to_period("M")
+        monthly = chart_df.groupby("MonthPeriod", as_index=False)["Amount"].sum().sort_values("MonthPeriod")
+        monthly["Month"] = monthly["MonthPeriod"].astype(str)
+        monthly["Amount"] = monthly["Amount"].abs()
+        fig_monthly = px.bar(
+            monthly,
+            x="Month",
+            y="Amount",
+            title="Monthly Spending",
+            labels={"Amount": "Total Spent ($)", "Month": ""},
+            color_discrete_sequence=["#1e3a5f"],
+        )
+        fig_monthly.update_layout(template="plotly_white", font=dict(family="sans-serif", size=12))
+        st.plotly_chart(fig_monthly, use_container_width=True)
 
-# 2. Category pie chart
-cat_sum = df_filtered.groupby("Category")["Amount"].sum().reset_index()
-cat_sum["Amount"] = cat_sum["Amount"].abs()
-# Professional financial color palette: navy, teal, coral, and professional grays
-financial_colors = ["#1e3a5f", "#00a699", "#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6", "#34495e", "#e91e63", "#00bcd4"]
-fig_pie = px.pie(
-    cat_sum,
-    values="Amount",
-    names="Category",
-    title="Spending by Category",
-    hole=0.4,
-    color_discrete_sequence=financial_colors,
-)
-fig_pie.update_traces(textposition="inside", textinfo="percent+label")
-fig_pie.update_layout(template="plotly_white", font=dict(family="sans-serif", size=12))
-st.plotly_chart(fig_pie, use_container_width=True)
+        cat_sum = chart_df.groupby("Category")["Amount"].sum().reset_index()
+        cat_sum["Amount"] = cat_sum["Amount"].abs()
+        financial_colors = ["#1e3a5f", "#00a699", "#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6", "#34495e", "#e91e63", "#00bcd4"]
+        fig_pie = px.pie(
+            cat_sum,
+            values="Amount",
+            names="Category",
+            title="Spending by Category",
+            hole=0.4,
+            color_discrete_sequence=financial_colors,
+        )
+        fig_pie.update_traces(textposition="inside", textinfo="percent+label")
+        fig_pie.update_layout(template="plotly_white", font=dict(family="sans-serif", size=12))
+        st.plotly_chart(fig_pie, use_container_width=True)
 
-# 3. Daily spending trend (line)
-daily = df_filtered.groupby(df_filtered["Date"].dt.date)["Amount"].sum().reset_index()
-daily["Amount"] = daily["Amount"].abs()
-fig_line = px.line(
-    daily,
-    x="Date",
-    y="Amount",
-    title="Daily Spending Trend",
-    labels={"Amount": "Spent ($)", "Date": ""},
-    color_discrete_sequence=["#00a699"],  # Teal for trend monitoring
+        daily = chart_df.groupby(chart_df["Date"].dt.date)["Amount"].sum().reset_index()
+        daily["Amount"] = daily["Amount"].abs()
+        fig_line = px.line(
+            daily,
+            x="Date",
+            y="Amount",
+            title="Daily Spending Trend",
+            labels={"Amount": "Spent ($)", "Date": ""},
+            color_discrete_sequence=["#00a699"],
+        )
+        fig_line.update_traces(line=dict(width=2.5))
+        fig_line.update_layout(template="plotly_white", font=dict(family="sans-serif", size=12), hovermode="x unified")
+        st.plotly_chart(fig_line, use_container_width=True)
+
+elif analysis_view == "All transactions":
+    chart_df = df_filtered.copy()
+    chart_df["MonthPeriod"] = chart_df["Date"].dt.to_period("M")
+    monthly_net = chart_df.groupby("MonthPeriod", as_index=False)["Amount"].sum().sort_values("MonthPeriod")
+    monthly_net["Month"] = monthly_net["MonthPeriod"].astype(str)
+    fig_monthly = px.bar(
+        monthly_net,
+        x="Month",
+        y="Amount",
+        title="Monthly Net Cash Flow",
+        labels={"Amount": "Net Cash Flow ($)", "Month": ""},
+        color_discrete_sequence=["#1e3a5f"],
+    )
+    fig_monthly.update_layout(template="plotly_white", font=dict(family="sans-serif", size=12))
+    st.plotly_chart(fig_monthly, use_container_width=True)
+
+    daily = chart_df.groupby(chart_df["Date"].dt.date)["Amount"].sum().reset_index()
+    fig_line = px.line(
+        daily,
+        x="Date",
+        y="Amount",
+        title="Daily Net Cash Flow",
+        labels={"Amount": "Net Cash Flow ($)", "Date": ""},
+        color_discrete_sequence=["#00a699"],
+    )
+    fig_line.update_traces(line=dict(width=2.5))
+    fig_line.update_layout(template="plotly_white", font=dict(family="sans-serif", size=12), hovermode="x unified")
+    st.plotly_chart(fig_line, use_container_width=True)
+
+else:
+    chart_df = df_filtered.copy()
+    chart_df["MonthPeriod"] = chart_df["Date"].dt.to_period("M")
+    monthly_flow = (
+        chart_df.assign(FlowType=np.where(chart_df["Amount"] >= 0, "Income", "Expenses"))
+        .assign(Amount=chart_df["Amount"].abs())
+        .groupby(["MonthPeriod", "FlowType"], as_index=False)["Amount"]
+        .sum()
+        .sort_values("MonthPeriod")
+    )
+    monthly_flow["Month"] = monthly_flow["MonthPeriod"].astype(str)
+    fig_monthly = px.bar(
+        monthly_flow,
+        x="Month",
+        y="Amount",
+        color="FlowType",
+        barmode="group",
+        title="Income vs Expenses by Month",
+        labels={"Amount": "Amount ($)", "Month": ""},
+        color_discrete_map={"Income": "#2ecc71", "Expenses": "#e74c3c"},
+    )
+    fig_monthly.update_layout(template="plotly_white", font=dict(family="sans-serif", size=12))
+    st.plotly_chart(fig_monthly, use_container_width=True)
+
+    flow_summary = (
+        chart_df.assign(FlowType=np.where(chart_df["Amount"] >= 0, "Income", "Expenses"))
+        .assign(Amount=chart_df["Amount"].abs())
+        .groupby("FlowType", as_index=False)["Amount"]
+        .sum()
+    )
+    fig_pie = px.pie(
+        flow_summary,
+        values="Amount",
+        names="FlowType",
+        title="Income vs Expenses",
+        hole=0.4,
+        color_discrete_map={"Income": "#2ecc71", "Expenses": "#e74c3c"},
+    )
+    fig_pie.update_traces(textposition="inside", textinfo="percent+label")
+    fig_pie.update_layout(template="plotly_white", font=dict(family="sans-serif", size=12))
+    st.plotly_chart(fig_pie, use_container_width=True)
+
+top_merchants = (
+    expense_df.groupby("Merchant", as_index=False)["Amount"].sum()
+    .assign(Amount=lambda frame: frame["Amount"].abs())
+    .sort_values("Amount", ascending=False)
+    .head(10)
 )
-fig_line.update_traces(line=dict(width=2.5))
-fig_line.update_layout(template="plotly_white", font=dict(family="sans-serif", size=12), hovermode="x unified")
-st.plotly_chart(fig_line, use_container_width=True)
+
+if not top_merchants.empty:
+    fig_merchants = px.bar(
+        top_merchants.sort_values("Amount", ascending=True),
+        x="Amount",
+        y="Merchant",
+        orientation="h",
+        title="Top 10 Merchants by Spend",
+        labels={"Amount": "Spent ($)", "Merchant": ""},
+        color_discrete_sequence=["#1e3a5f"],
+    )
+    fig_merchants.update_layout(template="plotly_white", font=dict(family="sans-serif", size=12))
+    st.plotly_chart(fig_merchants, use_container_width=True)
+else:
+    st.info("No merchant spend data available for the selected filters.")
 
 # ------------------------------
 # DATA TABLE
@@ -386,6 +610,6 @@ st.download_button(
 # Footer
 st.markdown("---")
 st.caption(
-    "🧟 **Finance Goblin** – Built by Fuaad Abdullah with Streamlit, Pandas & Plotly. "
-    "Your data stays in your browser. Licensed under MIT."
+    "🧟 **Finance Goblin** – Built by Fuaad Abdullah "
+    "Uploaded files are processed in-session and not saved permanently. Licensed under MIT."
 )
