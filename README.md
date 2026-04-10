@@ -42,7 +42,7 @@ Deploy for free to Streamlit Cloud:
 4. Streamlit automatically installs dependencies and deploys
 5. Share the live URL!
 
-**Live Demo:** [Your Streamlit Cloud URL] *(add after deployment)*
+**Live Demo:** https://finance-goblin-fuaadabdullah.streamlit.app
 
 ## 📊 Features
 
