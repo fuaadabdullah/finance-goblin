@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects
 from datetime import datetime, timedelta
 import re
 import random
@@ -33,13 +32,44 @@ def normalize_description_text(description):
     return normalized
 
 
+def canonicalize_merchant_text(description):
+    """Collapse merchant aliases into a stable merchant key."""
+    normalized = normalize_description_text(description)
+    merchant_aliases = {
+        "amazon": ["amazon", "aws"],
+        "mcdonald": ["mcd", "mcds", "mcdonald", "mcdonalds"],
+        "starbucks": ["starbucks"],
+        "uber": ["uber"],
+        "lyft": ["lyft"],
+        "doordash": ["doordash", "uber eats", "ubereats"],
+        "whole foods": ["whole foods", "wholefoods"],
+        "trader joe": ["trader joe", "trader joes", "traderjoes"],
+        "apple": ["apple", "apple com"],
+        "walmart": ["walmart"],
+        "target": ["target"],
+        "cvs pharmacy": ["cvs", "cvs pharmacy"],
+        "comcast": ["comcast"],
+        "airbnb": ["airbnb"],
+        "netflix": ["netflix"],
+        "spotify": ["spotify"],
+        "chevron": ["chevron"],
+        "shell gas": ["shell", "shell gas"],
+    }
+
+    for canonical, aliases in merchant_aliases.items():
+        for alias in aliases:
+            if normalized == alias or normalized.startswith(f"{alias} ") or alias in normalized.split():
+                return canonical
+
+    return normalized
+
+
 def generate_sample_df(num_rows=45):
     """Fallback sample data if sample_data.csv is unavailable."""
     np.random.seed(42)
     random.seed(42)
 
     end_date = datetime.now().date()
-    start_date = end_date - timedelta(days=90)
 
     vendor_pool = {
         "Starbucks": (3, 15),
@@ -126,16 +156,24 @@ def find_default_column(columns, candidates, fallback_index=0):
     return min(fallback_index, len(columns) - 1)
 
 
-def parse_amount_series(series):
-    """Parse amount-like strings (currency, commas, parentheses) to numeric."""
+@st.cache_data(show_spinner=False)
+def parse_amount_values(raw_values):
+    """Parse raw amount-like strings (currency, commas, parentheses) to numeric values."""
     cleaned = (
-        series.astype(str)
+        pd.Series(raw_values, dtype="string")
+        .astype(str)
         .str.strip()
         .str.replace(r"\$", "", regex=True)
         .str.replace(",", "", regex=False)
         .str.replace(r"^\((.*)\)$", r"-\1", regex=True)
     )
-    return pd.to_numeric(cleaned, errors="coerce")
+    return pd.to_numeric(cleaned, errors="coerce").tolist()
+
+
+def parse_amount_series(series):
+    """Parse amount-like series using the cached raw-value parser."""
+    parsed_values = parse_amount_values(tuple(series.tolist()))
+    return pd.Series(parsed_values, index=series.index)
 
 
 def detect_amount_sign_profile(series):
@@ -166,6 +204,21 @@ def detect_credit_debit_profile(df, credit_col, debit_col):
         "debit_count": int(len(debits)),
     }
 
+
+def resolve_category(description, merchant_key, category_overrides=None):
+    """Resolve category using overrides first, then keyword rules."""
+    category_overrides = category_overrides or {}
+    if merchant_key in category_overrides:
+        return category_overrides[merchant_key]
+
+    search_text = f"{normalize_description_text(description)} {merchant_key}"
+    for cat, keywords in CATEGORY_RULES.items():
+        if cat == "📌 Other":
+            continue
+        if any(kw in search_text for kw in keywords):
+            return cat
+    return "📌 Other"
+
 # ------------------------------
 # CATEGORIZATION RULES
 # ------------------------------
@@ -184,32 +237,10 @@ CATEGORY_RULES = {
 }
 
 
-def categorize(description):
-    desc_lower = normalize_description_text(description)
-    alias_map = {
-        "mcd": "mcdonald",
-        "mcds": "mcdonald",
-        "mcdonalds": "mcdonald",
-        "mcdonald s": "mcdonald",
-        "wholefoods": "whole foods",
-        "traderjoes": "trader joe",
-        "amazon marketplace": "amazon",
-        "apple com": "apple",
-    }
-    for alias, canonical in alias_map.items():
-        if alias in desc_lower:
-            desc_lower = desc_lower.replace(alias, canonical)
-    for cat, keywords in CATEGORY_RULES.items():
-        if cat == "📌 Other":
-            continue
-        if any(kw in desc_lower for kw in keywords):
-            return cat
-    return "📌 Other"
-
-
 # ------------------------------
 # DATA CLEANING & STANDARDIZATION
 # ------------------------------
+@st.cache_data(show_spinner=False)
 def clean_and_categorize(
     df,
     date_col,
@@ -218,6 +249,7 @@ def clean_and_categorize(
     credit_col=None,
     debit_col=None,
     invert_sign=False,
+    category_overrides=None,
 ):
     """Convert to standard columns and normalize to canonical direction.
 
@@ -228,7 +260,7 @@ def clean_and_categorize(
     df_clean = pd.DataFrame()
     df_clean["Date"] = pd.to_datetime(df[date_col], errors="coerce")
     df_clean["Description"] = df[desc_col].astype(str)
-    df_clean["Merchant"] = df_clean["Description"].apply(normalize_description_text)
+    df_clean["Merchant"] = df_clean["Description"].apply(canonicalize_merchant_text)
 
     if amount_col is not None:
         df_clean["Amount"] = parse_amount_series(df[amount_col])
@@ -244,7 +276,11 @@ def clean_and_categorize(
     df_clean = df_clean.dropna(subset=["Date", "Amount"])
 
     # Categorize
-    df_clean["Category"] = df_clean["Description"].apply(categorize)
+    category_overrides = category_overrides or {}
+    df_clean["Category"] = df_clean.apply(
+        lambda row: resolve_category(row["Description"], row["Merchant"], category_overrides),
+        axis=1,
+    )
 
     return df_clean
 
@@ -267,7 +303,10 @@ st.sidebar.download_button(
     help="Realistic demo dataset (~3 months of transactions).",
 )
 
-analysis_view = "Expenses only"
+if "category_overrides" not in st.session_state:
+    st.session_state["category_overrides"] = {}
+
+view_mode = "Expenses only"
 
 if uploaded_file is not None:
     try:
@@ -318,7 +357,7 @@ if uploaded_file is not None:
             index=find_default_column(columns, ["debit", "debits", "withdrawal"], fallback_index=3),
         )
 
-    analysis_view = st.sidebar.radio(
+    view_mode = st.sidebar.radio(
         "Analysis view",
         options=["Expenses only", "All transactions", "Income vs expenses"],
         index=0,
@@ -361,15 +400,23 @@ if uploaded_file is not None:
         credit_col=credit_col,
         debit_col=debit_col,
         invert_sign=invert_sign,
+        category_overrides=st.session_state["category_overrides"],
     )
     st.session_state["df"] = df
 else:
     # Use sample data as default
-    df = clean_and_categorize(sample_df, "Date", "Description", amount_col="Amount", invert_sign=False)
+    df = clean_and_categorize(
+        sample_df,
+        "Date",
+        "Description",
+        amount_col="Amount",
+        invert_sign=False,
+        category_overrides=st.session_state["category_overrides"],
+    )
     st.session_state["df"] = df
     st.sidebar.info("Using sample_data.csv by default. Upload your own CSV to replace.")
 
-st.subheader("🧼 Cleaned Data Preview")
+st.subheader("🧼 Data Preview")
 st.caption("Parsed columns after normalization so you can verify the import before exploring the dashboard.")
 st.dataframe(
     df[["Date", "Description", "Merchant", "Category", "Amount"]].head(10),
@@ -377,6 +424,30 @@ st.dataframe(
     hide_index=True,
     column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")},
 )
+
+with st.expander("Category overrides", expanded=False):
+    merchants = sorted(df["Merchant"].dropna().unique().tolist())
+    if merchants:
+        override_merchant = st.selectbox("Merchant", merchants, key="override_merchant")
+        override_category = st.selectbox("Category", sorted(CATEGORY_RULES.keys()), key="override_category")
+        left_col, right_col = st.columns(2)
+        if left_col.button("Save override", use_container_width=True):
+            st.session_state["category_overrides"][override_merchant] = override_category
+            st.rerun()
+        if right_col.button("Clear all overrides", use_container_width=True):
+            st.session_state["category_overrides"] = {}
+            st.rerun()
+        if st.session_state["category_overrides"]:
+            st.dataframe(
+                pd.DataFrame(
+                    sorted(st.session_state["category_overrides"].items()),
+                    columns=["Merchant", "Category"],
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+    else:
+        st.info("No merchants available yet.")
 
 # ------------------------------
 # MAIN DASHBOARD
@@ -422,7 +493,7 @@ avg_expense = expense_df["Amount"].abs().mean() if not expense_df.empty else 0.0
 num_transactions = len(df_filtered)
 
 col1, col2, col3 = st.columns(3)
-if analysis_view == "Expenses only":
+if view_mode == "Expenses only":
     col1.metric("💸 Total Spent", f"${total_expenses:,.2f}")
     col2.metric("📊 Avg Expense", f"${avg_expense:,.2f}")
     col3.metric("🔢 Transactions", num_transactions)
@@ -436,7 +507,44 @@ else:
 # ------------------------------
 st.subheader("📈 Spending Analysis")
 
-if analysis_view == "Expenses only":
+st.subheader("🧠 Spending Insight Engine")
+insight_col1, insight_col2, insight_col3 = st.columns(3)
+if total_income > 0:
+    percent_income_spent = (total_expenses / total_income) * 100
+    insight_col1.metric("% of Income Spent", f"{percent_income_spent:,.1f}%")
+else:
+    insight_col1.metric("% of Income Spent", "N/A")
+
+top_category_summary = (
+    expense_df.groupby("Category", as_index=False)["Amount"].sum().assign(Amount=lambda frame: frame["Amount"].abs()).sort_values("Amount", ascending=False)
+)
+top_3_categories = top_category_summary.head(3)
+if not top_3_categories.empty:
+    insight_col2.write(
+        "Top 3 categories: "
+        + ", ".join(f"{row.Category} (${row.Amount:,.2f})" for row in top_3_categories.itertuples())
+    )
+else:
+    insight_col2.write("Top 3 categories: N/A")
+
+monthly_expense_summary = (
+    expense_df.assign(MonthPeriod=expense_df["Date"].dt.to_period("M"))
+    .groupby("MonthPeriod", as_index=False)["Amount"]
+    .sum()
+    .sort_values("MonthPeriod")
+)
+if len(monthly_expense_summary) >= 2:
+    last_month = monthly_expense_summary.iloc[-1]["Amount"]
+    prev_month = monthly_expense_summary.iloc[-2]["Amount"]
+    spike_delta = abs(last_month) - abs(prev_month)
+    insight_col3.write(f"Biggest spike vs last month: ${spike_delta:,.2f}")
+else:
+    insight_col3.write("Biggest spike vs last month: N/A")
+
+if total_expenses > total_income:
+    st.warning("You are spending more than you earn.")
+
+if view_mode == "Expenses only":
     chart_df = expense_df.copy()
     if chart_df.empty:
         st.info("No expense transactions in the selected filters. Charts show spending only.")
@@ -485,7 +593,7 @@ if analysis_view == "Expenses only":
         fig_line.update_layout(template="plotly_white", font=dict(family="sans-serif", size=12), hovermode="x unified")
         st.plotly_chart(fig_line, use_container_width=True)
 
-elif analysis_view == "All transactions":
+elif view_mode == "All transactions":
     chart_df = df_filtered.copy()
     chart_df["MonthPeriod"] = chart_df["Date"].dt.to_period("M")
     monthly_net = chart_df.groupby("MonthPeriod", as_index=False)["Amount"].sum().sort_values("MonthPeriod")
@@ -601,7 +709,7 @@ with st.expander("View / search transactions", expanded=False):
 # ------------------------------
 tagged_csv = df_filtered.to_csv(index=False).encode("utf-8")
 st.download_button(
-    label="📥 Download Tagged CSV",
+    label="📥 Download CSV",
     data=tagged_csv,
     file_name="tagged_expenses.csv",
     mime="text/csv",
